@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Alerts Cleanup Agent</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 text-gray-800 min-h-screen font-sans antialiased">
+
+<div class="max-w-4xl mx-auto px-6 py-10">
+
+  <!-- Header ----------------------------------------------------------------->
+  <div class="flex items-start justify-between mb-10">
+    <div>
+      <h1 class="text-2xl font-semibold text-gray-900 tracking-tight">Alerts Cleanup Agent</h1>
+      <p class="text-sm text-gray-400 mt-1">PRTG / WUG sensor cleanup — engineer approval queue</p>
+    </div>
+    <button id="run-btn" onclick="runAgent()"
+      class="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg
+             hover:bg-indigo-700 active:scale-95 transition-all shadow-sm">
+      ▶&nbsp; Run agent scan
+    </button>
+  </div>
+
+  <!-- Stats ------------------------------------------------------------------>
+  <div class="grid grid-cols-3 gap-4 mb-8">
+    <div class="bg-white rounded-xl border border-gray-200 p-5 shadow-sm">
+      <p class="text-xs font-medium text-gray-400 uppercase tracking-widest mb-2">Pending review</p>
+      <p id="stat-pending" class="text-3xl font-semibold text-amber-500">—</p>
+    </div>
+    <div class="bg-white rounded-xl border border-gray-200 p-5 shadow-sm">
+      <p class="text-xs font-medium text-gray-400 uppercase tracking-widest mb-2">Approved</p>
+      <p id="stat-approved" class="text-3xl font-semibold text-green-600">—</p>
+    </div>
+    <div class="bg-white rounded-xl border border-gray-200 p-5 shadow-sm">
+      <p class="text-xs font-medium text-gray-400 uppercase tracking-widest mb-2">Rejected</p>
+      <p id="stat-rejected" class="text-3xl font-semibold text-gray-400">—</p>
+    </div>
+  </div>
+
+  <!-- Filter tabs ------------------------------------------------------------>
+  <div class="flex gap-2 mb-5" id="tabs">
+    <button onclick="loadProposals('all')"      id="tab-all"      class="tab on">All</button>
+    <button onclick="loadProposals('pending')"  id="tab-pending"  class="tab">Pending</button>
+    <button onclick="loadProposals('approved')" id="tab-approved" class="tab">Approved</button>
+    <button onclick="loadProposals('rejected')" id="tab-rejected" class="tab">Rejected</button>
+  </div>
+
+  <!-- Proposals list --------------------------------------------------------->
+  <div id="proposals" class="space-y-4"></div>
+
+</div>
+
+<!-- Toast notification -------------------------------------------------------->
+<div id="toast"
+  class="fixed bottom-6 right-6 bg-gray-900 text-white text-sm px-5 py-3 rounded-xl
+         shadow-lg opacity-0 pointer-events-none transition-opacity duration-300">
+</div>
+
+<style>
+  .tab {
+    padding: 6px 16px; font-size: 13px; border-radius: 8px; cursor: pointer;
+    border: 1px solid #e5e7eb; background: white; color: #6b7280;
+    transition: all .12s;
+  }
+  .tab:hover:not(.on) { border-color: #9ca3af; color: #374151; }
+  .tab.on { background: #1e293b; color: white; border-color: #1e293b; }
+</style>
+
+<script>
+// ─── Config ──────────────────────────────────────────────────────────────────
+const API = '';   // Same origin
+let activeTab = 'all';
+
+const CLASS_BADGE = {
+  orphan:            'bg-red-50 text-red-700 border border-red-200',
+  broken_connection: 'bg-blue-50 text-blue-700 border border-blue-200',
+  uncertain:         'bg-amber-50 text-amber-700 border border-amber-200',
+};
+const CLASS_LABEL = {
+  orphan:            'Orphaned resource',
+  broken_connection: 'Broken connection',
+  uncertain:         'Uncertain — review needed',
+};
+const ACTION_LABEL = {
+  delete_sensor:            '🗑  Delete sensor',
+  rotate_credentials:       '🔑  Rotate credentials',
+  check_agent_and_firewall: '🔌  Check agent & firewall',
+  check_network_path:       '🌐  Check network path',
+  manual_review:            '👁  Manual review',
+};
+const STATUS_BADGE = {
+  pending:  'bg-amber-50 text-amber-700 border border-amber-200',
+  approved: 'bg-green-50 text-green-700 border border-green-200',
+  rejected: 'bg-gray-100 text-gray-500 border border-gray-200',
+};
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+async function api(url, opts = {}) {
+  const r = await fetch(API + url, opts);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.opacity = '1';
+  setTimeout(() => el.style.opacity = '0', 2800);
+}
+
+function scoreBar(score) {
+  const color = score >= 65 ? '#ef4444' : score >= 31 ? '#f59e0b' : '#3b82f6';
+  return `
+    <div class="flex items-center gap-3 mt-3">
+      <div class="flex-1 bg-gray-100 rounded-full h-1.5 overflow-hidden">
+        <div style="width:${score}%;background:${color}" class="h-full rounded-full transition-all"></div>
+      </div>
+      <span class="text-xs tabular-nums text-gray-400 w-12 text-right">${score} / 100</span>
+    </div>`;
+}
+
+// ─── Proposal card ────────────────────────────────────────────────────────────
+function card(p) {
+  const isPending   = p.status === 'pending';
+  const classBadge  = CLASS_BADGE[p.classification]  || 'bg-gray-100 text-gray-600';
+  const classLabel  = CLASS_LABEL[p.classification]  || p.classification;
+  const actionLabel = ACTION_LABEL[p.proposed_action] || p.proposed_action;
+  const statBadge   = STATUS_BADGE[p.status] || '';
+
+  const actions = isPending
+    ? `<div class="flex gap-2 mt-5 pt-4 border-t border-gray-100">
+         <button onclick="review(${p.id},'approve')"
+           class="flex-1 py-2 text-sm font-medium bg-green-600 text-white rounded-lg
+                  hover:bg-green-700 transition-colors">
+           ✓&nbsp; Approve
+         </button>
+         <button onclick="review(${p.id},'reject')"
+           class="flex-1 py-2 text-sm font-medium bg-white text-gray-500 border border-gray-200
+                  rounded-lg hover:border-gray-400 transition-colors">
+           ✗&nbsp; Reject
+         </button>
+       </div>`
+    : `<div class="mt-5 pt-4 border-t border-gray-100">
+         <span class="text-xs px-2.5 py-1 rounded-full font-medium ${statBadge}">
+           ${p.status.charAt(0).toUpperCase() + p.status.slice(1)}
+           ${p.reviewed_at ? ' · ' + new Date(p.reviewed_at).toLocaleDateString() : ''}
+         </span>
+       </div>`;
+
+  return `
+  <div id="card-${p.id}" class="bg-white rounded-xl border border-gray-200 p-5 shadow-sm">
+
+    <div class="flex items-start justify-between gap-4">
+      <div class="flex-1 min-w-0">
+        <div class="flex items-center gap-2 flex-wrap mb-1.5">
+          <span class="text-sm font-semibold text-gray-900">${p.device_name}</span>
+          <span class="font-mono text-xs text-gray-400">${p.host}</span>
+        </div>
+        <div class="flex items-center gap-2 flex-wrap">
+          <span class="text-xs font-medium px-2 py-0.5 rounded-full ${classBadge}">${classLabel}</span>
+          <span class="text-xs text-gray-400">${actionLabel}</span>
+        </div>
+      </div>
+      <span class="text-xs text-gray-300 font-mono shrink-0 mt-0.5">#${p.sensor_id}</span>
+    </div>
+
+    ${scoreBar(p.evidence_score)}
+
+    <p class="text-sm text-gray-600 leading-relaxed mt-4">${p.evidence_summary}</p>
+
+    <div class="mt-3 px-3 py-2 bg-gray-50 rounded-lg border border-gray-100">
+      <span class="text-xs text-gray-400">Alert: </span>
+      <span class="text-xs text-gray-500 italic">${p.alert_message || '—'}</span>
+    </div>
+
+    ${actions}
+  </div>`;
+}
+
+// ─── Data loading ─────────────────────────────────────────────────────────────
+async function loadStats() {
+  const s = await api('/api/stats');
+  document.getElementById('stat-pending').textContent  = s.pending;
+  document.getElementById('stat-approved').textContent = s.approved;
+  document.getElementById('stat-rejected').textContent = s.rejected;
+}
+
+async function loadProposals(filter = 'all') {
+  activeTab = filter;
+  document.querySelectorAll('.tab').forEach(b => b.classList.remove('on'));
+  document.getElementById(`tab-${filter}`).classList.add('on');
+
+  const url = filter === 'all' ? '/api/proposals' : `/api/proposals?status=${filter}`;
+  const proposals = await api(url);
+  const el = document.getElementById('proposals');
+
+  if (!proposals.length) {
+    el.innerHTML = `<div class="text-center text-gray-400 text-sm py-16">
+      No proposals here — run an agent scan to get started.
+    </div>`;
+    return;
+  }
+  el.innerHTML = proposals.map(card).join('');
+}
+
+// ─── Actions ──────────────────────────────────────────────────────────────────
+async function review(id, action) {
+  const btn = document.querySelector(`#card-${id} button`);
+  if (btn) { btn.disabled = true; btn.textContent = '...'; }
+  try {
+    await api(`/api/proposals/${id}/${action}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({notes: ''}),
+    });
+    toast(`Proposal ${action}d`);
+    await Promise.all([loadStats(), loadProposals(activeTab)]);
+  } catch (e) {
+    toast('Error — see console');
+    console.error(e);
+  }
+}
+
+async function runAgent() {
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true;
+  btn.textContent = '⏳  Running...';
+  try {
+    const result = await api('/api/run-agent', {method: 'POST'});
+    toast(`Done: ${result.sensors_processed} sensors → ${result.proposals_created} proposals`);
+    await Promise.all([loadStats(), loadProposals(activeTab)]);
+  } catch (e) {
+    toast('Agent run failed — see console');
+    console.error(e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '▶  Run agent scan';
+  }
+}
+
+// ─── Initial load ─────────────────────────────────────────────────────────────
+Promise.all([loadStats(), loadProposals('all')]);
+</script>
+</body>
+</html>
